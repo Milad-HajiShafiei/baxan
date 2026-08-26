@@ -630,15 +630,15 @@ impl GuiApp {
         }
 
         // click to select
-        if response.clicked() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                for (i, event) in self.visible_events.iter().enumerate() {
-                    if let Some(r) = node_rects.get(&event.id) {
-                        if r.contains(pos) {
-                            self.selected = i;
-                            break;
-                        }
-                    }
+        if response.clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            for (i, event) in self.visible_events.iter().enumerate() {
+                if let Some(r) = node_rects.get(&event.id)
+                    && r.contains(pos)
+                {
+                    self.selected = i;
+                    break;
                 }
             }
         }

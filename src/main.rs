@@ -4,7 +4,8 @@ use std::{
     collections::HashMap,
     fs::{self, File},
     io::{self, BufRead, BufReader, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::Command,
     time::{Duration, Instant},
 };
 
@@ -46,24 +47,45 @@ struct Args {
     /// Use the terminal (TUI) interface instead of the egui GUI.
     #[arg(long)]
     tui: bool,
+    /// Build and run the project with automatic heap-allocation tracking,
+    /// then open the visualization.  No code changes required.
+    #[arg(long)]
+    run: bool,
+    /// Extra arguments forwarded to the project binary (used with --run).
+    args: Vec<String>,
 }
 
+/// The kind of lifecycle event observed for a variable.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
+    /// A new variable comes into scope.
     Declare,
+    /// A variable's value changes (mutation, resize, refcount change, etc.).
     Update,
+    /// A variable goes out of scope and is dropped.
     Drop,
 }
 
+/// A single observation event describing a variable's state at a point in time.
+///
+/// This is the core data type of the JSONL protocol. Each line in a Baxan
+/// event stream deserializes into one `VariableEvent`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VariableEvent {
+    /// Monotonically increasing sequence number.
     pub seq: u64,
+    /// Timestamp in milliseconds (used for timeline ordering).
     pub time_ms: u64,
+    /// Lifecycle event kind (declare, update, or drop).
     pub kind: EventKind,
+    /// Unique variable identifier (used for edges like `points_to` and `borrows`).
     pub id: String,
+    /// Display name shown in the graph.
     pub name: String,
+    /// Rust type name (e.g. `"Vec<u8>"`, `"Arc<State>"`).
     pub type_name: String,
+    /// Human-readable value snapshot (e.g. `"len=4"`, `"ready: true"`).
     pub value: String,
     #[serde(default = "default_location")]
     pub location: String,
@@ -91,15 +113,21 @@ fn default_storage() -> String {
     "stack".into()
 }
 
+/// Internal state tracking a variable across its lifetime.
+///
+/// Tracks the most recent event, when the variable was declared,
+/// when (if ever) it was dropped, and how many updates have been observed.
 #[derive(Clone, Debug)]
 pub struct VariableState {
     current: VariableEvent,
-    declared_at: u64,
+    /// The `time_ms` at which this variable was first declared.
+    pub declared_at: u64,
     dropped_at: Option<u64>,
     updates: u32,
 }
 
 impl VariableState {
+    /// Returns `true` if this variable is alive (declared and not yet dropped) at the given time.
     pub fn is_alive_at(&self, time_ms: u64) -> bool {
         self.declared_at <= time_ms && self.dropped_at.is_none_or(|drop| time_ms < drop)
     }
@@ -583,6 +611,7 @@ fn paint_memory_graph(ctx: &mut Context, app: &App) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_arrow(
     ctx: &mut Context,
     from_x: f64,
@@ -770,8 +799,8 @@ fn lifetime_panel(app: &App) -> Paragraph<'static> {
             .max(start + 1)
             .min(width);
         let mut bar = vec![' '; width];
-        for slot in start..end {
-            bar[slot] = '━';
+        for slot in &mut bar[start..end] {
+            *slot = '━';
         }
         bar[start] = '●';
         if state.dropped_at.is_some() && end > 0 {
@@ -943,11 +972,9 @@ fn draw_controls(
     controls_area: ratatui::layout::Rect,
     status_area: ratatui::layout::Rect,
 ) {
-    let progress = if app.max_ms == 0 {
-        0
-    } else {
-        (app.cursor_ms * 100 / app.max_ms) as u16
-    };
+    let progress = app.cursor_ms.checked_div(app.max_ms)
+        .map(|ratio| (ratio * 100) as u16)
+        .unwrap_or(0);
     let controls = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -1134,17 +1161,16 @@ fn run(mut terminal: DefaultTerminal, mut app: App) -> io::Result<()> {
     loop {
         app.tick();
         terminal.draw(|frame| ui(frame, &app))?;
-        if event::poll(Duration::from_millis(80))? {
-            if let Event::Key(key) = event::read()? {
-                if handle_key(&mut app, key) {
-                    return Ok(());
-                }
-            }
+        if event::poll(Duration::from_millis(80))?
+            && let Event::Key(key) = event::read()?
+            && handle_key(&mut app, key)
+        {
+            return Ok(());
         }
     }
 }
 
-fn load_events(path: &PathBuf) -> Vec<VariableEvent> {
+fn load_events(path: &Path) -> Vec<VariableEvent> {
     std::fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
@@ -1152,8 +1178,172 @@ fn load_events(path: &PathBuf) -> Vec<VariableEvent> {
         .collect()
 }
 
+// ------------------------------------------------------------------
+// Automatic tracking (--run)
+// ------------------------------------------------------------------
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn tracker_filename() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "libbaxan_tracker.so"
+    } else {
+        "libbaxan_tracker.dylib"
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn extract_tracker() -> io::Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libbaxan_tracker.dylib"));
+    #[cfg(target_os = "linux")]
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libbaxan_tracker.so"));
+    let path = std::env::temp_dir().join(tracker_filename());
+    std::fs::write(&path, BYTES)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(path)
+}
+
+fn find_binary_name(project: &Path) -> String {
+    // Try cargo metadata to find the first binary target
+    if let Ok(output) = Command::new("cargo")
+        .args(["metadata", "--format-version=1", "--no-deps"])
+        .current_dir(project)
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                if let Some(pkgs) = meta["packages"].as_array() {
+                    for pkg in pkgs {
+                        if let Some(targets) = pkg["targets"].as_array() {
+                            for t in targets {
+                                if t["kind"].as_array().is_some_and(|k| k.iter().any(|v| v == "bin")) {
+                                    if let Some(name) = t["name"].as_str() {
+                                        return name.to_string();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Fall back to package name
+                    if let Some(name) = pkgs[0]["name"].as_str() {
+                        return name.to_string();
+                    }
+                }
+            }
+        }
+    }
+    // Fall back to directory name
+    project
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("main")
+        .to_string()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn run_project(_project: &PathBuf, _extra_args: &[String]) -> eframe::Result<()> {
+    eprintln!("Automatic tracking (--run) is not supported on this platform.");
+    eprintln!("Use --events with a manual JSONL emitter instead.");
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_project(project: &PathBuf, extra_args: &[String]) -> eframe::Result<()> {
+    let project = fs::canonicalize(project).unwrap_or_else(|_| project.clone());
+
+    // 1. Build the project (no instrumentation or special flags needed:
+    //    the tracker rebinds malloc/free pointers at runtime).
+    eprintln!("\u{1f4e6} Building project...");
+    let status = match Command::new("cargo")
+        .arg("build")
+        .arg("--release")
+        .current_dir(&project)
+        .status()
+    {
+        Ok(s) => s,
+        Err(e) => { eprintln!("\u{274c} Failed to run cargo build: {e}"); std::process::exit(1); }
+    };
+    if !status.success() {
+        eprintln!("\u{274c} Build failed");
+        std::process::exit(1);
+    }
+    eprintln!("\u{2705} Build complete");
+
+    // 2. Find the binary
+    let bin_name = find_binary_name(&project);
+    let bin_path = project.join("target/release").join(&bin_name);
+    if !bin_path.exists() {
+        eprintln!("\u{274c} Binary not found: {}", bin_path.display());
+        std::process::exit(1);
+    }
+
+    // 3. Extract the tracker shared library
+    let tracker_path = match extract_tracker() {
+        Ok(p) => p,
+        Err(e) => { eprintln!("\u{274c} Failed to extract tracker: {e}"); std::process::exit(1); }
+    };
+    eprintln!("\u{1f50d} Tracker loaded: {}", tracker_path.display());
+
+    // 4. Events file
+    let events_path = std::env::temp_dir().join(format!("baxan_{}.jsonl", std::process::id()));
+
+    // 5. Run the project with the tracker injected
+    eprintln!("\u{1f680} Running project with memory tracking...");
+    let mut cmd = Command::new(&bin_path);
+    cmd.current_dir(&project);
+    cmd.args(extra_args);
+    cmd.env("LD_PRELOAD", &tracker_path);
+    cmd.env("DYLD_INSERT_LIBRARIES", &tracker_path);
+    cmd.env("BAXAN_TRACKER_OUTPUT", &events_path);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => { eprintln!("\u{274c} Failed to run project: {e}"); std::process::exit(1); }
+    };
+    let exit_status = match child.wait() {
+        Ok(s) => s,
+        Err(e) => { eprintln!("\u{274c} Process error: {e}"); std::process::exit(1); }
+    };
+    eprintln!("\u{2705} Process exited: {exit_status}");
+
+    // 6. Load captured events
+    let events = load_events(&events_path);
+    eprintln!("\u{1f4ca} Captured {} heap allocation events", events.len());
+
+    // 7. Clean up temp files
+    let _ = std::fs::remove_file(&tracker_path);
+    let _ = std::fs::remove_file(&events_path);
+
+    if events.is_empty() {
+        eprintln!("\u{26a0}\u{fe0f}  No heap allocations captured. The program may use a custom allocator.");
+        return Ok(());
+    }
+
+    // 8. Open the visualization
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([1200.0, 800.0])
+            .with_title("Baxan \u{2014} Memory Visualization"),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Baxan",
+        options,
+        Box::new(move |cc| Ok(Box::new(gui::GuiApp::new(cc, events)))),
+    )
+}
+
 fn main() -> eframe::Result<()> {
     let args = Args::parse();
+
+    if args.run {
+        return run_project(&args.project, &args.args);
+    }
 
     if args.tui {
         let project = fs::canonicalize(&args.project).unwrap_or(args.project);
@@ -1170,11 +1360,12 @@ fn main() -> eframe::Result<()> {
     }
 
     // Default: egui GUI
-    let events = if args.demo || args.events.is_none() {
+    let events = if args.demo {
         demo_events()
-    } else {
-        let path = args.events.unwrap();
+    } else if let Some(path) = args.events {
         load_events(&path)
+    } else {
+        demo_events()
     };
 
     let options = eframe::NativeOptions {
@@ -1191,6 +1382,10 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+/// Returns a built-in deterministic event stream for demonstration purposes.
+///
+/// The demo includes stack variables, heap allocations, `Arc` shared state,
+/// borrows, mutations, and drops across multiple threads.
 pub fn demo_events() -> Vec<VariableEvent> {
     vec![
         VariableEvent {
