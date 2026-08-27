@@ -148,7 +148,7 @@ If the target program uses a custom global allocator (via `#[global_allocator]`)
 
 ### Ratatui terminal UI
 
-Baxan always opens the Ratatui terminal interface directly. There is no graphical UI or GUI mode. The interface supports live event tailing, playback, timeline scrubbing, memory zones, lifetime history, and pointer/borrow relationships.
+Baxan always opens the Ratatui terminal interface directly. There is no graphical UI or GUI mode. The interface supports live event tailing, playback, timeline scrubbing, memory zones, lifetime history, pointer/borrow relationships, and automatic scrolling/paging of long views. Press `a` to toggle auto-scrolling.
 
 The graph legend is also shown in the bottom border of the `VISUALIZE` tab:
 
@@ -185,6 +185,7 @@ The right-side **Inspector** panel shows full details for the selected variable.
 | **/** | Start a filter search |
 | **Enter** | Apply the filter |
 | **c** | Clear the filter |
+| **a** | Toggle automatic scrolling/paging |
 | **q** / **Esc** | Quit |
 
 Filtering searches variable names, types, values, zones, storage classes, threads, locations, event types (`declare`, `update`, `drop`), and status (`alive`, `dropped`).

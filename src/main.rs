@@ -151,8 +151,10 @@ struct App {
     file_offset: u64,
     status: String,
     graph_focus: usize,
+    graph_page: usize,
     filter: String,
     filter_active: bool,
+    auto_scroll: bool,
 }
 
 impl App {
@@ -174,8 +176,10 @@ impl App {
             file_offset: 0,
             status: "Ready · memory map follows runtime events".into(),
             graph_focus: 0,
+            graph_page: 0,
             filter: String::new(),
             filter_active: false,
+            auto_scroll: true,
         };
         app.rebuild();
         app
@@ -204,8 +208,10 @@ impl App {
             file_offset: 0,
             status: "Ready · memory map follows runtime events".into(),
             graph_focus: 0,
+            graph_page: 0,
             filter: String::new(),
             filter_active: false,
+            auto_scroll: true,
         };
         app.rebuild();
         app
@@ -213,6 +219,9 @@ impl App {
 
     fn tick(&mut self) {
         self.animation_frame = self.animation_frame.wrapping_add(1);
+        if (self.playing || self.follow_live) && self.auto_scroll && self.animation_frame % 30 == 0 {
+            self.graph_page = self.graph_page.wrapping_add(1);
+        }
         if self.events_path.is_some() && self.follow_live {
             self.read_new_events();
         }
@@ -360,6 +369,7 @@ impl App {
         if self.graph_focus >= self.visible_events.len() {
             self.graph_focus = self.visible_events.len().saturating_sub(1);
         }
+        self.graph_page = self.graph_focus / GRAPH_PAGE_SIZE;
     }
 
     fn selected_state(&self) -> Option<&VariableState> {
@@ -426,6 +436,7 @@ impl App {
 }
 
 const ZONES: [&str; 4] = ["stack", "heap", "data", "sync"];
+const GRAPH_PAGE_SIZE: usize = 8;
 const MAX_VISIBLE_NODES: usize = 2_000;
 const MAX_RECORD_EVENTS: usize = 100_000;
 
@@ -551,6 +562,7 @@ fn draw_record_view(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let lines = app
         .source_events
         .iter()
+        .filter(|event| event.time_ms <= app.cursor_ms || app.follow_live)
         .rev()
         .take(MAX_RECORD_EVENTS)
         .collect::<Vec<_>>()
@@ -570,6 +582,11 @@ fn draw_record_view(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             ])
         })
         .collect::<Vec<_>>();
+    let scroll = if app.auto_scroll {
+        lines.len().saturating_sub(area.height.saturating_sub(2) as usize) as u16
+    } else {
+        0
+    };
     let content = if lines.is_empty() {
         Text::from("No recorded events yet. Use --events or --run to load a recording.")
     } else {
@@ -578,6 +595,7 @@ fn draw_record_view(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     frame.render_widget(
         Paragraph::new(content)
             .wrap(Wrap { trim: true })
+            .scroll((scroll, 0))
             .block(panel_block(" recording events ")),
         area,
     );
@@ -607,9 +625,15 @@ fn draw_relationships_view(frame: &mut Frame, app: &App, area: ratatui::layout::
             Style::default().fg(Color::DarkGray),
         )));
     }
+    let scroll = if app.auto_scroll {
+        lines.len().saturating_sub(area.height.saturating_sub(2) as usize) as u16
+    } else {
+        0
+    };
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: true })
+            .scroll((scroll, 0))
             .block(panel_block(" ownership & borrow relationships ")),
         area,
     );
@@ -638,12 +662,16 @@ fn paint_memory_graph(ctx: &mut Context, app: &App) {
         ("data", 2.0, 25.0),
         ("sync", 52.0, 25.0),
     ];
-    let mut positions = HashMap::new();        for (zone, x, y) in zone_positions {
+    let mut positions = HashMap::new();
+    for (zone, x, y) in zone_positions {
         let events = app
             .visible_events
             .iter()
             .filter(|event| event_zone(event) == zone)
             .collect::<Vec<_>>();
+        if events.is_empty() {
+            continue;
+        }
         let color = zone_color(zone);
         ctx.draw(&Rectangle {
             x,
@@ -660,7 +688,13 @@ fn paint_memory_graph(ctx: &mut Context, app: &App) {
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             )),
         );
-        for (index, event) in events.iter().take(8).enumerate() {
+        let page_count = events.len().div_ceil(GRAPH_PAGE_SIZE).max(1);
+        let page_start = if app.playing && page_count > 1 {
+            ((app.animation_frame as usize / 30) % page_count) * GRAPH_PAGE_SIZE
+        } else {
+            (app.graph_page % page_count) * GRAPH_PAGE_SIZE
+        };
+        for (index, event) in events.iter().skip(page_start).take(GRAPH_PAGE_SIZE).enumerate() {
             let column = index % 2;
             let row = index / 2;
             let node_x = x + 2.0 + column as f64 * 22.0;
@@ -742,12 +776,12 @@ fn paint_memory_graph(ctx: &mut Context, app: &App) {
                 )),
             );
         }
-        if events.len() > 8 {
+        if events.len() > GRAPH_PAGE_SIZE {
             ctx.print(
                 x + 2.0,
                 y + 1.5,
                 Line::from(Span::styled(
-                    format!("+{} more nodes", events.len() - 8),
+                    format!("page {}/{} · ←/→", (app.graph_page % page_count) + 1, page_count),
                     Style::default().fg(Color::DarkGray),
                 )),
             );
@@ -1282,10 +1316,10 @@ fn draw_controls(
         Paragraph::new(Line::from(vec![
             Span::styled("  ", Style::default()),
             Span::styled(
-                if app.filter_active { "FILTER" } else { "filter" },
+                if app.filter_active {                "FILTER" } else { "filter" },
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!(" [{}]  ·  {}", app.filter, app.status)),
+            Span::raw(format!(" [{}]  ·  auto-scroll: {}  ·  {}", app.filter, if app.auto_scroll { "on" } else { "off" }, app.status)),
         ]))
         .style(Style::default().fg(Color::Gray)),
         status_area,
@@ -1496,6 +1530,14 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             app.clear_filter();
             false
         }
+        KeyCode::Char('a') => {
+            app.auto_scroll = !app.auto_scroll;
+            app.status = format!(
+                "Auto-scroll {}",
+                if app.auto_scroll { "enabled" } else { "disabled" }
+            );
+            false
+        }
         KeyCode::Tab => {
             app.active_tab = (app.active_tab + 1) % 4;
             false
@@ -1513,11 +1555,24 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             false
         }
         KeyCode::Left => {
-            app.step_to_previous_event();
+            if app.graph_page > 0 && !app.playing {
+                app.graph_page -= 1;
+                app.graph_focus = (app.graph_page * GRAPH_PAGE_SIZE).min(app.visible_events.len().saturating_sub(1));
+                app.selected = app.graph_focus;
+            } else {
+                app.step_to_previous_event();
+            }
             false
         }
         KeyCode::Right => {
-            app.step_to_next_event();
+            let page_count = app.visible_events.len().div_ceil(GRAPH_PAGE_SIZE).max(1);
+            if page_count > 1 {
+                app.graph_page = (app.graph_page + 1).min(page_count - 1);
+                app.graph_focus = (app.graph_page * GRAPH_PAGE_SIZE).min(app.visible_events.len().saturating_sub(1));
+                app.selected = app.graph_focus;
+            } else {
+                app.step_to_next_event();
+            }
             false
         }
         _ => false,
