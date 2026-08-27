@@ -137,7 +137,9 @@ static void track_free(void *p) {
 static void *track_calloc(size_t n, size_t s) {
     void *p = real_calloc(n, s);
     if (p) {
-        size_t total = n * s;
+        /* n * s overflow-safe: calloc already checked, but verify for reporting */
+        size_t total;
+        if (__builtin_mul_overflow(n, s, &total)) total = SIZE_MAX;
         char id[24], addr[24], val[24];
         snprintf(id,   sizeof(id),   "h_%p", p);
         snprintf(addr, sizeof(addr), "%p",   p);
@@ -172,6 +174,11 @@ static void perform_rebinding(section_t *sect, intptr_t slide,
                               uint32_t *indirect_symtab) {
     uint32_t *indices = indirect_symtab + sect->reserved1;
     void **bindings = (void **)((uintptr_t)slide + sect->addr);
+    /* Make the entire section writable once before patching pointers. */
+    kern_return_t kr = vm_protect(mach_task_self(),
+                                  (uintptr_t)bindings, sect->size, 0,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) return;
     for (uint32_t i = 0; i < sect->size / sizeof(void *); i++) {
         uint32_t idx = indices[i];
         if (idx == INDIRECT_SYMBOL_ABS || idx == INDIRECT_SYMBOL_LOCAL ||
@@ -203,11 +210,7 @@ static void perform_rebinding(section_t *sect, intptr_t slide,
         if (replaced && bindings[i] != replacement)
             *replaced = bindings[i];
 
-        kern_return_t err = vm_protect(mach_task_self(),
-                                       (uintptr_t)bindings, sect->size, 0,
-                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-        if (err == KERN_SUCCESS)
-            bindings[i] = replacement;
+        bindings[i] = replacement;
     }
 }
 
@@ -321,7 +324,8 @@ void *calloc(size_t n, size_t s) {
     if (!rc) rc = dlsym(RTLD_NEXT, "calloc");
     void *p = rc(n, s);
     if (p) {
-        size_t total = n * s;
+        size_t total;
+        if (__builtin_mul_overflow(n, s, &total)) total = SIZE_MAX;
         char id[24], addr[24], val[24];
         snprintf(id,   sizeof(id),   "h_%p", p);
         snprintf(addr, sizeof(addr), "%p",   p);

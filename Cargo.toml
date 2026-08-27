@@ -3,7 +3,7 @@ name = "baxan"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Live Rust variable lifetime and memory visualizer with egui GUI and Ratatui TUI"
+description = "Live Rust variable lifetime and memory visualizer with Ratatui TUI"
 license = "MIT"
 repository = "https://github.com/Milad-HajiShafiei/baxan"
 homepage = "https://github.com/Milad-HajiShafiei/baxan"
@@ -19,7 +19,6 @@ include = ["src/**/*.rs", "src/tracker.c", "build.rs", "Cargo.toml", "LICENSE", 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
 crossterm = "0.29.0"
-eframe = "0.36"
 ratatui = "0.30.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

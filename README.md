@@ -2,7 +2,7 @@
 
 **Live Rust memory and lifetime visualizer.**
 
-Baxan renders a real-time graph of heap allocations, byte sizes, lifetimes, and drop history for a Rust program. It ships with two front-ends — an **egui** native GUI (default) and a **Ratatui** terminal UI — so you can pick whichever fits your workflow.
+Baxan renders a real-time graph of heap allocations, byte sizes, lifetimes, and drop history for a Rust program in a terminal UI powered by Ratatui.
 
 ## Zero-code automatic tracking
 
@@ -19,7 +19,7 @@ That's it — **no code changes, no macros, no special build flags.** Baxan buil
 - **Timeline playback** — scrub, play, and pause through recorded events with smooth animation.
 - **Live tailing** — point Baxan at a JSONL file that a running process is appending to; new events appear in real time.
 - **Inspector panel** — select any node to see its full details: value, zone, storage class, address, lifetime span, source location, thread, and update count.
-- **Dual front-ends** — egui GUI for a graphical experience, Ratatui TUI for remote/SSH/headless environments.
+- **Terminal-first interface** — Ratatui works locally, over SSH, and in headless environments.
 - **Demo mode** — built-in deterministic event stream so you can try Baxan without writing any instrumentation.
 
 ## Installation
@@ -27,8 +27,8 @@ That's it — **no code changes, no macros, no special build flags.** Baxan buil
 ```bash
 # Clone and run directly
 git clone <repo-url> && cd baxan/baxan
-cargo run --release          # egui GUI (default)
-cargo run --release -- --tui # Ratatui TUI
+cargo run --release          # Ratatui terminal UI
+cargo run --release # Ratatui terminal UI
 ```
 
 ### From crates.io (once published)
@@ -39,11 +39,11 @@ cargo install baxan
 # Automatically track and visualize any Rust project
 baxan --run --project /path/to/rust/project
 
-# Run the GUI with the built-in demo
+# Run the terminal UI with the built-in demo
 baxan --demo
 
 # Run the TUI with the demo
-baxan --tui --demo
+baxan --demo
 
 # Watch a live event file
 baxan --events /path/to/events.jsonl
@@ -52,7 +52,7 @@ baxan --events /path/to/events.jsonl
 ### Requirements
 
 - Rust 1.85+ (edition 2024)
-- A graphical environment for the egui GUI (X11, Wayland, macOS, Windows)
+- A terminal supporting Unicode and alternate-screen mode
 - The TUI mode works over SSH or in any terminal with 24-bit color support
 - `--run` (automatic tracking) needs a C compiler (`cc`/`clang`/`gcc`) available at build time and works on Linux and macOS
 
@@ -62,11 +62,11 @@ baxan --events /path/to/events.jsonl
 # Automatically track and visualize any Rust project (no code changes)
 cargo run --release -- --run --project /path/to/rust/project
 
-# Launch the GUI with the bundled demo stream
+# Launch the terminal UI with the bundled demo stream
 cargo run --release
 
 # Launch the TUI with the demo
-cargo run --release -- --tui --demo
+cargo run --release -- --demo
 
 # Watch a live event file
 cargo run --release -- --events /path/to/events.jsonl
@@ -82,7 +82,7 @@ cargo run --release -- --events /path/to/events.jsonl
 | `--run` | Build & run the project with automatic heap tracking, then visualize (**no code changes needed**) |
 | `-e`, `--events <FILE>` | JSONL event file to load or tail |
 | `--demo` | Start with the bundled deterministic demo stream |
-| `--tui` | Use the Ratatui terminal interface instead of the egui GUI |
+The application always uses the Ratatui terminal interface.
 | `-V`, `--version` | Print version |
 | `-h`, `--help` | Print help |
 
@@ -99,7 +99,7 @@ What happens under the hood:
 1. **Build** — `cargo build --release` in the project directory.
 2. **Inject** — a small C tracker library is extracted and loaded into the target process via `LD_PRELOAD` (Linux) or `DYLD_INSERT_LIBRARIES` (macOS). No source changes, macros, or `RUSTFLAGS` are required.
 3. **Capture** — every `malloc` / `free` / `calloc` / `realloc` call is intercepted and written to a JSONL event file. The tracker uses raw `write()` and a spinlock so it never re-enters the allocator.
-4. **Visualize** — the recording is loaded into the egui GUI. Press **V** to see the memory graph.
+4. **Visualize** — the recording is loaded into the Ratatui terminal interface.
 
 On macOS the tracker rebinds the indirect symbol pointers (`__got` / `__la_symbol_ptr`) in every loaded image via the Mach-O indirect symbol table — the same technique the `fishhook` library uses — so it works on release binaries without recompiling them. On Linux it uses the standard `dlsym(RTLD_NEXT)` interposition.
 
@@ -112,9 +112,9 @@ If the target program uses a custom global allocator (via `#[global_allocator]`)
 - use `--events` with a manual emitter (see below), or
 - add `#[global_allocator] static A: System = System;` to the target so allocations go through the system allocator.
 
-### egui GUI (default)
+### Ratatui terminal UI
 
-When you launch Baxan without `--tui`, the native egui window opens with a welcome screen.
+When you launch Baxan, the Ratatui terminal interface opens directly.
 
 | Key | Action |
 |-----|--------|
@@ -136,7 +136,7 @@ The visualization is divided into four color-coded zones:
 
 The right-side **Inspector** panel shows full details for the selected variable.
 
-### Ratatui TUI (`--tui`)
+### Ratatui terminal UI
 
 | Key | Action |
 |-----|--------|
@@ -303,22 +303,20 @@ cargo run --release -p baxan -- --events events.jsonl
                     └────┬────┘
               ┌──────────┼──────────┐
               ▼          ▼          ▼
-         ┌─────────┐ ┌──────┐ ┌─────────┐
-         │  egui   │ │ Ratatui │ (future) │
-         │  GUI    │ │  TUI    │  Web     │
+         ┌─────────┐ ┌──────┐ ┌─────────┐          │          Ratatui terminal UI          │
          └─────────┘ └─────────┘ └─────────┘
 ```
 
 - **Protocol consumer** — Baxan reads observations from an emitter. For zero-code tracking it bundles a C allocator hook (`src/tracker.c`, built by `build.rs` and embedded in the binary); for rich data it consumes JSONL from a proc-macro, a `tracing` layer, a `gdb`/`lldb` adapter, or a `cargo` runner.
 - **Stateful rebuild** — the in-memory recording is reconstructed at every timeline position. Dropped values remain available for replay while the live map shows the current state.
-- **Dual front-end** — the same event types and state management code (`EventKind`, `VariableEvent`, `VariableState`) are shared between the egui and Ratatui front-ends via `mod gui` and inline TUI code.
+- **Terminal front-end** — event types and state management are rendered by the Ratatui terminal interface.
 - **Zone-based layout** — variables are grouped into four memory zones (stack, heap, data, sync) for at-a-glance understanding of allocation patterns.
 
 ## Dependencies
 
 | Crate | Purpose |
 |-------|---------|
-| [eframe](https://crates.io/crates/eframe) 0.36 | Native egui GUI framework |
+
 | [ratatui](https://crates.io/crates/ratatui) 0.30 | Terminal UI framework |
 | [crossterm](https://crates.io/crates/crossterm) 0.29 | Terminal backend for Ratatui |
 | [clap](https://crates.io/crates/clap) 4.6 | Command-line argument parsing |
@@ -327,7 +325,7 @@ cargo run --release -p baxan -- --events events.jsonl
 
 ## Roadmap
 
-- [ ] Live event tailing in the egui GUI (read new JSONL lines while running)
+- [x] Live event tailing in the terminal UI (read new JSONL lines while running)
 - [ ] Draggable nodes in the visualization graph
 - [ ] Dark / light theme toggle
 - [ ] WebAssembly target for in-browser visualization

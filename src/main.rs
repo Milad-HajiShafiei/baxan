@@ -1,5 +1,3 @@
-mod gui;
-
 use std::{
     collections::HashMap,
     fs::{self, File},
@@ -44,11 +42,8 @@ struct Args {
     /// Start with the bundled deterministic demo stream.
     #[arg(long)]
     demo: bool,
-    /// Use the terminal (TUI) interface instead of the egui GUI.
-    #[arg(long)]
-    tui: bool,
     /// Build and run the project with automatic heap-allocation tracking,
-    /// then open the visualization.  No code changes required.
+    /// then open the terminal visualization. No code changes required.
     #[arg(long)]
     run: bool,
     /// Extra arguments forwarded to the project binary (used with --run).
@@ -1245,14 +1240,14 @@ fn find_binary_name(project: &Path) -> String {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn run_project(_project: &PathBuf, _extra_args: &[String]) -> eframe::Result<()> {
+fn run_project(_project: &PathBuf, _extra_args: &[String]) -> io::Result<()> {
     eprintln!("Automatic tracking (--run) is not supported on this platform.");
     eprintln!("Use --events with a manual JSONL emitter instead.");
     Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn run_project(project: &PathBuf, extra_args: &[String]) -> eframe::Result<()> {
+fn run_project(project: &PathBuf, extra_args: &[String]) -> io::Result<()> {
     let project = fs::canonicalize(project).unwrap_or_else(|_| project.clone());
 
     // 1. Build the project (no instrumentation or special flags needed:
@@ -1323,63 +1318,39 @@ fn run_project(project: &PathBuf, extra_args: &[String]) -> eframe::Result<()> {
         return Ok(());
     }
 
-    // 8. Open the visualization
-    let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 800.0])
-            .with_title("Baxan \u{2014} Memory Visualization"),
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "Baxan",
-        options,
-        Box::new(move |cc| Ok(Box::new(gui::GuiApp::new(cc, events)))),
-    )
+    // 8. Open the terminal visualization.
+    let project = project.clone();
+    enable_raw_mode().ok();
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen).ok();
+    let terminal = ratatui::init();
+    let result = run(terminal, App::new(project, None, false));
+    ratatui::restore();
+    disable_raw_mode().ok();
+    execute!(io::stdout(), LeaveAlternateScreen).ok();
+    result
 }
 
-fn main() -> eframe::Result<()> {
+fn main() -> io::Result<()> {
     let args = Args::parse();
 
     if args.run {
         return run_project(&args.project, &args.args);
     }
 
-    if args.tui {
-        let project = fs::canonicalize(&args.project).unwrap_or(args.project);
-        enable_raw_mode().ok();
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen).ok();
-        let terminal = ratatui::init();
-        let result = run(terminal, App::new(project, args.events, args.demo));
-        ratatui::restore();
-        disable_raw_mode().ok();
-        execute!(io::stdout(), LeaveAlternateScreen).ok();
-        if let Err(e) = result { eprintln!("TUI error: {e}"); }
-        return Ok(());
+    let project = fs::canonicalize(&args.project).unwrap_or(args.project);
+    enable_raw_mode().ok();
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen).ok();
+    let terminal = ratatui::init();
+    let result = run(terminal, App::new(project, args.events, args.demo));
+    ratatui::restore();
+    disable_raw_mode().ok();
+    execute!(io::stdout(), LeaveAlternateScreen).ok();
+    if let Err(error) = &result {
+        eprintln!("TUI error: {error}");
     }
-
-    // Default: egui GUI
-    let events = if args.demo {
-        demo_events()
-    } else if let Some(path) = args.events {
-        load_events(&path)
-    } else {
-        demo_events()
-    };
-
-    let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 800.0])
-            .with_title("Baxan \u{2014} Memory Visualizer"),
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "Baxan",
-        options,
-        Box::new(move |cc| Ok(Box::new(gui::GuiApp::new(cc, events)))),
-    )
+    result
 }
 
 /// Returns a built-in deterministic event stream for demonstration purposes.

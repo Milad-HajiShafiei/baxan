@@ -1,0 +1,8 @@
+[package]
+name = "heap_app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "heap_app"
+path = "src/main.rs"
