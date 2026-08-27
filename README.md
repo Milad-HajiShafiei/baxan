@@ -2,7 +2,11 @@
 
 **Live Rust memory and lifetime visualizer.**
 
-Baxan renders a real-time graph of heap allocations, byte sizes, lifetimes, and drop history for a Rust program in a terminal UI powered by Ratatui.
+<img src="./assets/baxan.png" />
+
+<br/>
+
+Baxan is a terminal-only Rust memory and lifetime visualizer. It renders a real-time graph of heap allocations, byte sizes, lifetimes, and drop history using Ratatui.
 
 ## Zero-code automatic tracking
 
@@ -14,10 +18,12 @@ That's it — **no code changes, no macros, no special build flags.** Baxan buil
 
 ## Features
 
-- **Memory graph visualization** — variables are laid out inside *stack*, *heap*, *data/static*, and *sync/shared* zones as typed boxes showing name, type, value, address, and byte size.
+- **Memory graph visualization** — variables are grouped into *stack*, *heap*, *data/static*, and *sync/shared* zones with fixed, readable terminal node cards.
+- **Adaptive large-recording protection** — live input retains at most 100,000 events and the graph renders at most 2,000 matching nodes to keep the TUI responsive.
+- **JSON/text reports** — export a machine-readable snapshot or human-readable report without opening the TUI.
 - **Ownership and borrow arrows** — solid arrows for ownership/pointer links (`points_to`), dotted animated arrows for borrows/references (`borrows`).
 - **Timeline playback** — scrub, play, and pause through recorded events with smooth animation.
-- **Live tailing** — point Baxan at a JSONL file that a running process is appending to; new events appear in real time.
+- **Live tailing** — point Baxan at a JSONL file that a running process is appending to; new events appear in real time, with safety limits for very large recordings.
 - **Inspector panel** — select any node to see its full details: value, zone, storage class, address, lifetime span, source location, thread, and update count.
 - **Terminal-first interface** — Ratatui works locally, over SSH, and in headless environments.
 - **Demo mode** — built-in deterministic event stream so you can try Baxan without writing any instrumentation.
@@ -28,7 +34,6 @@ That's it — **no code changes, no macros, no special build flags.** Baxan buil
 # Clone and run directly
 git clone <repo-url> && cd baxan/baxan
 cargo run --release          # Ratatui terminal UI
-cargo run --release # Ratatui terminal UI
 ```
 
 ### From crates.io (once published)
@@ -40,9 +45,6 @@ cargo install baxan
 baxan --run --project /path/to/rust/project
 
 # Run the terminal UI with the built-in demo
-baxan --demo
-
-# Run the TUI with the demo
 baxan --demo
 
 # Watch a live event file
@@ -65,14 +67,27 @@ cargo run --release -- --run --project /path/to/rust/project
 # Launch the terminal UI with the bundled demo stream
 cargo run --release
 
-# Launch the TUI with the demo
-cargo run --release -- --demo
-
 # Watch a live event file
 cargo run --release -- --events /path/to/events.jsonl
 ```
 
 ## Usage
+
+Baxan runs entirely in the terminal. The application switches to the terminal's alternate screen while running and restores the original screen when you quit with `q` or `Esc`.
+
+Mouse interaction is supported for tab switching, playback toggling, and graph focus scrolling. Keyboard navigation remains the primary way to step through nodes and timeline events.
+
+```bash
+# Use demo data
+baxan --demo
+
+# Load an existing JSONL event stream
+baxan --events recording.jsonl
+
+# Build, run, and track a Rust project automatically
+baxan --run --project ./my-rust-project
+```
+
 
 ### Command-line options
 
@@ -82,9 +97,28 @@ cargo run --release -- --events /path/to/events.jsonl
 | `--run` | Build & run the project with automatic heap tracking, then visualize (**no code changes needed**) |
 | `-e`, `--events <FILE>` | JSONL event file to load or tail |
 | `--demo` | Start with the bundled deterministic demo stream |
-The application always uses the Ratatui terminal interface.
+| `--export <FILE>` | Write a snapshot/report and exit without opening the TUI |
+| `--export-format <json\|text>` | Select JSON (default) or plain-text report format |
+
+The application uses the Ratatui terminal interface unless `--export` is supplied.
 | `-V`, `--version` | Print version |
 | `-h`, `--help` | Print help |
+
+## Exporting reports
+
+Create a machine-readable JSON snapshot:
+
+```bash
+baxan --demo --export snapshot.json
+```
+
+Create a human-readable text report:
+
+```bash
+baxan --events recording.jsonl --export report.txt --export-format text
+```
+
+Exports contain the event count, timeline duration, node count, and the latest state for each recorded variable.
 
 ## Automatic heap tracking (`--run`)
 
@@ -114,16 +148,16 @@ If the target program uses a custom global allocator (via `#[global_allocator]`)
 
 ### Ratatui terminal UI
 
-When you launch Baxan, the Ratatui terminal interface opens directly.
+Baxan always opens the Ratatui terminal interface directly. There is no graphical UI or GUI mode. The interface supports live event tailing, playback, timeline scrubbing, memory zones, lifetime history, and pointer/borrow relationships.
 
-| Key | Action |
-|-----|--------|
-| **V** | Toggle the visualization on/off |
-| **Space** | Play / pause the timeline animation |
-| **R** | Jump to live mode (follow newest events) |
-| **↑** / **↓** | Select previous / next variable node |
-| **←** / **→** | Scrub the timeline backward / forward by 200 ms |
-| **Click** | Click a node in the graph to select it |
+The graph legend is also shown in the bottom border of the `VISUALIZE` tab:
+
+- **Green** boxes/borders represent stack and frame data.
+- **Magenta** boxes/borders represent heap-owned data.
+- **Yellow** boxes/borders represent static/data storage.
+- **Blue** boxes/borders represent synchronized or shared data.
+- **Solid arrows (`──`)** represent ownership or pointer/update relationships.
+- **Dotted arrows (`···`)** represent borrows or references.
 
 The visualization is divided into four color-coded zones:
 
@@ -134,26 +168,37 @@ The visualization is divided into four color-coded zones:
 | **DATA / STATIC** | 🟡 Yellow | `static`, `const`, read-only data |
 | **SYNC / SHARED** | 🔵 Blue | `Arc`, `Rc`, `Mutex`, `RwLock`, `RefCell`, `Cell` |
 
-The right-side **Inspector** panel shows full details for the selected variable.
-
-### Ratatui terminal UI
+The right-side **Inspector** panel shows full details for the selected variable. In the `VISUALIZE` tab, the focused node is highlighted and navigation updates the selected-node inspector.
 
 | Key | Action |
 |-----|--------|
 | **Space** | Play / pause the recording |
 | **r** | Follow live events |
-| **↑** / **↓** or **j** / **k** | Select previous / next node |
-| **←** / **→** | Scrub the timeline |
+| **↑** / **↓** or **j** / **k** | Move focus between nodes vertically |
+| **h** / **l** | Move focus between nodes horizontally |
+| **[** / **]** | Step to the previous / next recorded event |
+| **Enter** | Select the focused node |
+| **Mouse click** | Select tabs or toggle playback |
+| **Mouse wheel** | Move graph focus between nodes |
 | **Tab** | Switch between views (VISUALIZE, MEMORY MAP, RECORD, RELATIONSHIPS) |
 | **s** | Save the current recording to `.baxan-recording.jsonl` |
+| **/** | Start a filter search |
+| **Enter** | Apply the filter |
+| **c** | Clear the filter |
 | **q** / **Esc** | Quit |
+
+Filtering searches variable names, types, values, zones, storage classes, threads, locations, event types (`declare`, `update`, `drop`), and status (`alive`, `dropped`).
 
 The TUI has four tabs:
 
 1. **VISUALIZE** — full-screen memory graph with zone rectangles, variable boxes, and animated arrows.
 2. **MEMORY MAP** — four zone panels with ASCII-art variable boxes, a lifetime lane timeline, an inspector, and a relationship list.
-3. **RECORD** — (reserved for future recording UI).
-4. **RELATIONSHIPS** — flat list of all ownership and borrow edges.
+3. **RECORD** — chronological list of every recorded declaration, update, and drop event.
+4. **RELATIONSHIPS** — dedicated list of ownership/pointer and borrow/reference edges in the current timeline state.
+
+## Large recordings
+
+Baxan protects the terminal UI from unbounded recordings. Live input keeps at most 100,000 events in memory, while the graph displays at most 2,000 matching nodes at a time. The full retained recording remains available in the `RECORD` tab and through export.
 
 ## JSONL protocol
 
@@ -174,15 +219,15 @@ Each line is one JSON event. Baxan expects the following fields:
 | `storage` | `string` | ❌ | Allocation class (default: `"stack"`) |
 | `zone` | `string` | ❌ | Override zone grouping (auto-inferred from `storage` if omitted) |
 | `address` | `string` | ❌ | Display address or allocation identity |
-| `points_to` | `string[]` | ❌ | IDs this variable owns / points to (solid arrows) |
+| `points_to` | `string[]` | ❌ | IDs this variable owns / points to (solid arrows); automatic `realloc` events reference the previous allocation here |
 | `borrows` | `string[]` | ❌ | IDs this variable borrows / references (dotted arrows) |
 | `bytes` | `u64` | ❌ | Byte size of the allocation |
-| `thread` | `string` | ❌ | Thread name (default: `"main"`) |
+| `thread` | `string` | ❌ | Thread identifier/name (manual events default to `"main"`; automatic tracking emits `thread-<id>`) |
 
 ### Event kinds
 
 - **`declare`** — a new variable comes into scope. Baxan creates a node in the graph.
-- **`update`** — the variable's value changes (mutation, resize, refcount change, etc.). The node updates in place; the update count increments.
+- **`update`** — the variable's value changes (mutation, resize, refcount change, etc.). The node updates in place; the update count increments. Automatic `realloc` operations emit a drop for the old allocation followed by a declaration pointing to it via `points_to`.
 - **`drop`** — the variable goes out of scope. The node is shown as dropped (dimmed) in the graph but remains available for replay.
 
 ### Zone inference
@@ -290,33 +335,56 @@ cargo run --release -p baxan -- --events events.jsonl
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────┐
-│                   Instrumented Rust process          │
-│  (proc-macro · tracing layer · debugger adapter)    │
-│                        │                             │
-│                   JSONL stdout / file                │
-└────────────────────────┬────────────────────────────┘
-                         │
-                    ┌────▼────┐
-                    │  Baxan  │
-                    └────┬────┘
-              ┌──────────┼──────────┐
-              ▼          ▼          ▼
-         ┌─────────┐ ┌──────┐ ┌─────────┐          │          Ratatui terminal UI          │
-         └─────────┘ └─────────┘ └─────────┘
+```text
+┌──────────────────────┐
+│ Instrumented process │
+│ Rust app / emitter   │
+└──────────┬───────────┘
+           │ JSONL events
+           ▼
+┌──────────────────────┐      ┌──────────────────────┐
+│ Baxan event reader   │◄─────│ Live JSONL file      │
+│ parser + retention   │      │ (optional)           │
+└──────────┬───────────┘      └──────────────────────┘
+           │
+           ▼
+┌──────────────────────┐
+│ Timeline state engine │
+│ playback + filtering │
+└───────┬──────────────┘
+        │
+        ▼
+┌─────────────────────────────────────┐
+│ Ratatui terminal interface           │
+│                                     │
+│ VISUALIZE · MEMORY MAP · RECORD     │
+│ RELATIONSHIPS · timeline · export   │
+└─────────────────────────────────────┘
 ```
 
-- **Protocol consumer** — Baxan reads observations from an emitter. For zero-code tracking it bundles a C allocator hook (`src/tracker.c`, built by `build.rs` and embedded in the binary); for rich data it consumes JSONL from a proc-macro, a `tracing` layer, a `gdb`/`lldb` adapter, or a `cargo` runner.
-- **Stateful rebuild** — the in-memory recording is reconstructed at every timeline position. Dropped values remain available for replay while the live map shows the current state.
-- **Terminal front-end** — event types and state management are rendered by the Ratatui terminal interface.
-- **Zone-based layout** — variables are grouped into four memory zones (stack, heap, data, sync) for at-a-glance understanding of allocation patterns.
+### Data flow
+
+1. **Capture** — a Rust emitter writes Baxan-compatible JSONL. With `--run`, the bundled C allocator tracker intercepts `malloc`, `calloc`, `realloc`, and `free`.
+2. **Read** — Baxan parses the recording, tails new lines when requested, and retains events within its safety limit.
+3. **Rebuild** — the timeline state engine reconstructs variable state at the current timestamp, including declarations, updates, drops, filters, and reallocation links.
+4. **Render** — Ratatui renders the graph, memory map, event record, relationships, inspector, timeline, and legend.
+5. **Export** — `--export` writes a JSON snapshot or text report from the loaded recording without starting the interactive TUI.
+
+### Current limits and supported workflows
+
+- Live recordings retain up to 100,000 events.
+- The graph renders up to 2,000 matching nodes.
+- `/` starts interactive filtering; filters match names, types, values, zones, threads, locations, event kinds, and alive/dropped status.
+- `--export` supports `json` and `text` reports. SVG/PNG export is intentionally not supported.
+- Automatic tracking emits relative timestamps, thread identifiers, allocation addresses, sizes, and `realloc` links through `points_to`.
+- Mouse interaction is intentionally limited to basic tab switching, playback toggling, and focus scrolling; full mouse graph/timeline navigation remains outside the current scope.
+
+For automatic tracking, `src/tracker.c` is compiled by `build.rs` and embedded into the Baxan binary. The tracker emits relative timestamps, thread identifiers, allocation addresses, sizes, and reallocation relationships through `points_to`.
 
 ## Dependencies
 
 | Crate | Purpose |
 |-------|---------|
-
 | [ratatui](https://crates.io/crates/ratatui) 0.30 | Terminal UI framework |
 | [crossterm](https://crates.io/crates/crossterm) 0.29 | Terminal backend for Ratatui |
 | [clap](https://crates.io/crates/clap) 4.6 | Command-line argument parsing |
@@ -326,11 +394,12 @@ cargo run --release -p baxan -- --events events.jsonl
 ## Roadmap
 
 - [x] Live event tailing in the terminal UI (read new JSONL lines while running)
-- [ ] Draggable nodes in the visualization graph
+- [x] Interactive terminal graph navigation
 - [ ] Dark / light theme toggle
-- [ ] WebAssembly target for in-browser visualization
+- [x] Export JSON snapshots and text reports
+- [x] Automatic tracker thread identifiers and reallocation relationships
+- [ ] Configurable event/node limits and playback speed
 - [ ] Integration with `cargo-inspect` / `rust-analyzer` for automatic instrumentation
-- [ ] Export snapshots as SVG / PNG
 - [ ] Multi-thread timeline with per-thread lanes
 - [ ] Stack / borrow tracking via DWARF or debugger integration
 

@@ -150,6 +150,14 @@ fn tracker_emits_valid_jsonl_with_heap_events() {
             val.get("bytes").is_some(),
             "line {i} missing 'bytes': {line}"
         );
+        assert!(
+            val.get("thread").and_then(|value| value.as_str()).is_some(),
+            "line {i} missing string 'thread': {line}"
+        );
+        assert!(
+            val.get("points_to").and_then(|value| value.as_array()).is_some(),
+            "line {i} missing array 'points_to': {line}"
+        );
 
         // Kind must be declare, update, or drop
         let kind = val["kind"].as_str().expect("kind is not a string");

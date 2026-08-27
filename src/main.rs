@@ -9,7 +9,7 @@ use std::{
 
 use clap::Parser;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -46,6 +46,12 @@ struct Args {
     /// then open the terminal visualization. No code changes required.
     #[arg(long)]
     run: bool,
+    /// Export a JSON snapshot or text report and exit instead of opening the TUI.
+    #[arg(long, value_name = "FILE")]
+    export: Option<PathBuf>,
+    /// Export format: json or text.
+    #[arg(long, default_value = "json", requires = "export")]
+    export_format: String,
     /// Extra arguments forwarded to the project binary (used with --run).
     args: Vec<String>,
 }
@@ -144,6 +150,9 @@ struct App {
     animation_frame: u16,
     file_offset: u64,
     status: String,
+    graph_focus: usize,
+    filter: String,
+    filter_active: bool,
 }
 
 impl App {
@@ -169,6 +178,9 @@ impl App {
             animation_frame: 0,
             file_offset: 0,
             status: "Ready · memory map follows runtime events".into(),
+            graph_focus: 0,
+            filter: String::new(),
+            filter_active: false,
         };
         app.rebuild();
         app
@@ -176,17 +188,49 @@ impl App {
 
     fn tick(&mut self) {
         self.animation_frame = self.animation_frame.wrapping_add(1);
-        if self.events_path.is_some() && !self.playing {
+        if self.events_path.is_some() && self.follow_live {
             self.read_new_events();
         }
-        if self.playing && self.last_tick.elapsed() >= Duration::from_millis(120) {
+        if self.playing {
+            let elapsed_ms = self.last_tick.elapsed().as_millis() as u64;
+            if elapsed_ms == 0 {
+                return;
+            }
             self.last_tick = Instant::now();
-            self.cursor_ms = self.cursor_ms.saturating_add(120).min(self.max_ms);
+            self.cursor_ms = self.cursor_ms.saturating_add(elapsed_ms).min(self.max_ms);
             if self.cursor_ms >= self.max_ms {
                 self.playing = false;
             }
-            self.rebuild_visible();
+            self.rebuild();
         }
+    }
+
+    fn step_to_next_event(&mut self) {
+        let next_time = self
+            .source_events
+            .iter()
+            .map(|event| event.time_ms)
+            .filter(|&time| time > self.cursor_ms)
+            .min();
+        self.follow_live = false;
+        self.playing = false;
+        self.cursor_ms = next_time.unwrap_or(self.max_ms);
+        self.rebuild();
+        self.status = format!("Step: {}ms / {}ms", self.cursor_ms, self.max_ms);
+    }
+
+    fn step_to_previous_event(&mut self) {
+        let previous_time = self
+            .source_events
+            .iter()
+            .map(|event| event.time_ms)
+            .filter(|&time| time < self.cursor_ms)
+            .max();
+        self.follow_live = false;
+        self.playing = false;
+        self.cursor_ms = previous_time.unwrap_or(0);
+        self.rebuild();
+        self.status = format!("Step: {}ms / {}ms", self.cursor_ms, self.max_ms);
     }
 
     fn read_new_events(&mut self) {
@@ -211,8 +255,10 @@ impl App {
         let mut added = 0;
         while reader.read_line(&mut line).unwrap_or(0) > 0 {
             if let Ok(event) = serde_json::from_str::<VariableEvent>(line.trim()) {
-                self.source_events.push(event);
-                added += 1;
+                if self.source_events.len() < MAX_RECORD_EVENTS {
+                    self.source_events.push(event);
+                    added += 1;
+                }
             }
             line.clear();
         }
@@ -271,15 +317,23 @@ impl App {
     }
 
     fn rebuild_visible(&mut self) {
+        let filter = self.filter.to_lowercase();
         self.visible_events = self
             .states
             .values()
             .filter(|state| state.is_alive_at(self.cursor_ms) || state.dropped_at.is_some())
+            .filter(|state| filter.is_empty() || matches_filter(state, &filter))
             .map(|state| state.current.clone())
             .collect();
-        self.visible_events.sort_by_key(|event| event.seq);
+        self.visible_events
+            .sort_by_key(|event| (event.time_ms, event.seq));
+        self.visible_events.truncate(MAX_VISIBLE_NODES);
+        self.visible_events.sort_by_key(|event| (event.time_ms, event.seq));
         if self.selected >= self.visible_events.len() {
             self.selected = self.visible_events.len().saturating_sub(1);
+        }
+        if self.graph_focus >= self.visible_events.len() {
+            self.graph_focus = self.visible_events.len().saturating_sub(1);
         }
     }
 
@@ -289,10 +343,15 @@ impl App {
     }
 
     fn toggle_play(&mut self) {
+        if self.source_events.is_empty() {
+            self.status = "No events available for playback".into();
+            return;
+        }
         if self.cursor_ms >= self.max_ms {
             self.cursor_ms = 0;
             self.rebuild();
         }
+        self.last_tick = Instant::now();
         self.playing = !self.playing;
         self.follow_live = false;
         self.status = if self.playing {
@@ -305,9 +364,26 @@ impl App {
 
     fn reset_live(&mut self) {
         self.playing = false;
+        self.last_tick = Instant::now();
         self.follow_live = true;
         self.rebuild();
         self.status = "Live · following newest event".into();
+    }
+
+    fn toggle_filter(&mut self) {
+        self.filter_active = !self.filter_active;
+        self.status = if self.filter_active {
+            "Filter enabled · type text, Enter applies, Esc clears".into()
+        } else {
+            "Filter disabled".into()
+        };
+    }
+
+    fn clear_filter(&mut self) {
+        self.filter.clear();
+        self.filter_active = false;
+        self.rebuild_visible();
+        self.status = "Filter cleared".into();
     }
 
     fn export_record(&mut self) {
@@ -325,6 +401,8 @@ impl App {
 }
 
 const ZONES: [&str; 4] = ["stack", "heap", "data", "sync"];
+const MAX_VISIBLE_NODES: usize = 2_000;
+const MAX_RECORD_EVENTS: usize = 100_000;
 
 fn ui(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -333,7 +411,7 @@ fn ui(frame: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(17),
-            Constraint::Length(3),
+            Constraint::Length(5),
             Constraint::Length(2),
         ])
         .split(area);
@@ -341,6 +419,17 @@ fn ui(frame: &mut Frame, app: &App) {
 
     if app.active_tab == 0 {
         draw_visualize_panel(frame, app, vertical[1]);
+        draw_graph_hints(frame, vertical[1]);
+        draw_controls(frame, app, vertical[2], vertical[3]);
+        return;
+    }
+    if app.active_tab == 2 {
+        draw_record_view(frame, app, vertical[1]);
+        draw_controls(frame, app, vertical[2], vertical[3]);
+        return;
+    }
+    if app.active_tab == 3 {
+        draw_relationships_view(frame, app, vertical[1]);
         draw_controls(frame, app, vertical[2], vertical[3]);
         return;
     }
@@ -433,11 +522,79 @@ fn draw_header(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     );
 }
 
+fn draw_record_view(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let lines = app
+        .source_events
+        .iter()
+        .rev()
+        .take(MAX_RECORD_EVENTS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|event| {
+            let kind = match event.kind {
+                EventKind::Declare => "DECLARE",
+                EventKind::Update => "UPDATE ",
+                EventKind::Drop => "DROP   ",
+            };
+            Line::from(vec![
+                Span::styled(format!("{:>6}ms ", event.time_ms), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{} ", kind), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(event.name.clone(), Style::default().fg(Color::Cyan)),
+                Span::raw(format!(" : {} = {} ({} bytes)", event.type_name, event.value, event.bytes)),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let content = if lines.is_empty() {
+        Text::from("No recorded events yet. Use --events or --run to load a recording.")
+    } else {
+        Text::from(lines)
+    };
+    frame.render_widget(
+        Paragraph::new(content)
+            .wrap(Wrap { trim: true })
+            .block(panel_block(" recording events ")),
+        area,
+    );
+}
+
+fn draw_relationships_view(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let mut lines = Vec::new();
+    for event in &app.visible_events {
+        for target in &event.points_to {
+            lines.push(Line::from(vec![
+                Span::styled(event.name.clone(), Style::default().fg(Color::Yellow)),
+                Span::styled("  ── owns/update ──▶  ", Style::default().fg(Color::Magenta)),
+                Span::styled(target.clone(), Style::default().fg(Color::White)),
+            ]));
+        }
+        for target in &event.borrows {
+            lines.push(Line::from(vec![
+                Span::styled(event.name.clone(), Style::default().fg(Color::Yellow)),
+                Span::styled("  ··· borrows/reference ···▶  ", Style::default().fg(Color::LightBlue)),
+                Span::styled(target.clone(), Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No ownership or borrow relationships reported.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: true })
+            .block(panel_block(" ownership & borrow relationships ")),
+        area,
+    );
+}
+
 fn draw_visualize_panel(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let canvas = Canvas::default()
         .block(
             Block::default()
-                .title(" live memory graph · dotted = borrow/reference · solid = ownership/update ")
+                .title(" live memory graph ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         )
@@ -449,15 +606,14 @@ fn draw_visualize_panel(frame: &mut Frame, app: &App, area: ratatui::layout::Rec
 }
 
 fn paint_memory_graph(ctx: &mut Context, app: &App) {
+    let focused_id = app.visible_events.get(app.graph_focus).map(|event| event.id.as_str());
     let zone_positions = [
         ("stack", 2.0, 52.0),
         ("heap", 52.0, 52.0),
         ("data", 2.0, 25.0),
         ("sync", 52.0, 25.0),
     ];
-    let mut positions = HashMap::new();
-
-    for (zone, x, y) in zone_positions {
+    let mut positions = HashMap::new();        for (zone, x, y) in zone_positions {
         let events = app
             .visible_events
             .iter()
@@ -489,12 +645,15 @@ fn paint_memory_graph(ctx: &mut Context, app: &App) {
                 .visible_events
                 .get(app.selected)
                 .is_some_and(|selected| selected.id == event.id);
+            let focused = focused_id == Some(event.id.as_str());
             let dropped = app
                 .states
                 .get(&event.id)
                 .is_some_and(|state| state.dropped_at.is_some());
             let node_color = if selected {
                 Color::White
+            } else if focused {
+                Color::Cyan
             } else if dropped {
                 Color::DarkGray
             } else {
@@ -507,6 +666,22 @@ fn paint_memory_graph(ctx: &mut Context, app: &App) {
                 height: 9.0,
                 color: node_color,
             });
+            if focused {
+                ctx.draw(&Rectangle {
+                    x: node_x - 1.0,
+                    y: node_y - 1.0,
+                    width: 20.0,
+                    height: 11.0,
+                    color: Color::Cyan,
+                });
+                ctx.draw(&Rectangle {
+                    x: node_x,
+                    y: node_y,
+                    width: 18.0,
+                    height: 9.0,
+                    color: node_color,
+                });
+            }
             let state = &app.states[&event.id];
             let update_mark = if state.updates > 0 { " ⇄" } else { "" };
             ctx.print(
@@ -668,6 +843,29 @@ fn draw_arrow(
         y2: tip_y - uy * 2.5 - py * 1.5,
         color,
     });
+}
+
+fn matches_filter(state: &VariableState, filter: &str) -> bool {
+    let event = &state.current;
+    let event_kind = match event.kind {
+        EventKind::Declare => "declare",
+        EventKind::Update => "update",
+        EventKind::Drop => "drop",
+    };
+    let status = if state.dropped_at.is_some() { "dropped" } else { "alive" };
+    [
+        event.name.as_str(),
+        event.type_name.as_str(),
+        event.value.as_str(),
+        event.storage.as_str(),
+        event.zone.as_str(),
+        event.thread.as_str(),
+        event.location.as_str(),
+        event_kind,
+        status,
+    ]
+    .into_iter()
+    .any(|field| field.to_lowercase().contains(filter))
 }
 
 fn zone_panel(app: &App, zone: &str) -> Paragraph<'static> {
@@ -967,9 +1165,13 @@ fn draw_controls(
     controls_area: ratatui::layout::Rect,
     status_area: ratatui::layout::Rect,
 ) {
-    let progress = app.cursor_ms.checked_div(app.max_ms)
-        .map(|ratio| (ratio * 100) as u16)
-        .unwrap_or(0);
+    // Gauge::percent expects an integer percentage. Integer division before
+    // multiplying made every partial position render as 0%.
+    let progress = if app.max_ms == 0 {
+        0
+    } else {
+        ((app.cursor_ms.min(app.max_ms) as f64 / app.max_ms as f64) * 100.0).round() as u16
+    };
     let controls = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -1004,6 +1206,23 @@ fn draw_controls(
         ),
         controls[0],
     );
+    let focused_description = app
+        .visible_events
+        .get(app.graph_focus)
+        .map(|event| format!("{} · {} · {} bytes", event.name, event.type_name, event.bytes))
+        .unwrap_or_else(|| "No node focused".into());
+    let timeline = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Length(3)])
+        .split(controls[1]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("  Focused: {focused_description}"),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )))
+        .alignment(ratatui::layout::Alignment::Center),
+        timeline[0],
+    );
     frame.render_widget(
         Gauge::default()
             .block(
@@ -1014,15 +1233,15 @@ fn draw_controls(
             )
             .gauge_style(Style::default().fg(Color::Cyan))
             .label(format!("{}ms / {}ms", app.cursor_ms, app.max_ms))
-            .percent(progress),
-        controls[1],
+            .percent(progress.min(100)),
+        timeline[1],
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓", Style::default().fg(Color::Yellow)),
             Span::raw(" node   "),
             Span::styled("←→", Style::default().fg(Color::Yellow)),
-            Span::raw(" scrub   "),
+            Span::raw(" scrub [ ]   "),
             Span::styled("q", Style::default().fg(Color::Yellow)),
             Span::raw(" quit"),
         ]))
@@ -1035,10 +1254,58 @@ fn draw_controls(
         controls[2],
     );
     frame.render_widget(
-        Paragraph::new(format!("  {}", app.status)).style(Style::default().fg(Color::Gray)),
+        Paragraph::new(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(
+                if app.filter_active { "FILTER" } else { "filter" },
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" [{}]  ·  {}", app.filter, app.status)),
+        ]))
+        .style(Style::default().fg(Color::Gray)),
         status_area,
     );
 }
+
+fn hint_line<'a>(marker: &'a str, label: &'a str, color: Color) -> Line<'a> {
+    Line::from(vec![
+        Span::styled("●", Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled(label, Style::default().fg(Color::White)),
+        Span::raw("  "),
+        Span::styled(marker, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+    ])
+}
+
+fn draw_graph_hints(frame: &mut Frame, area: ratatui::layout::Rect) {
+    let hints_width = 34.min(area.width.saturating_sub(2));
+    let hints_height = 8.min(area.height);
+    if hints_width < 20 || hints_height < 3 {
+        return;
+    }
+    let hints_area = ratatui::layout::Rect {
+        x: area.x + area.width.saturating_sub(hints_width),
+        y: area.y + area.height.saturating_sub(hints_height),
+        width: hints_width,
+        height: hints_height,
+    };
+    let hints = Paragraph::new(Text::from(vec![
+        hint_line("green", "Stack / frames", Color::Green),
+        hint_line("magenta", "Heap / owned", Color::Magenta),
+        hint_line("yellow", "Data / static", Color::Yellow),
+        hint_line("blue", "Sync / shared", Color::LightBlue),
+        hint_line("──", "Owns / update", Color::Magenta),
+        hint_line("···", "Borrows / reference", Color::LightBlue),
+    ]))
+    .block(
+        Block::default()
+            .title(" legend ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    frame.render_widget(hints, hints_area);
+}
+
 
 fn event_zone(event: &VariableEvent) -> &str {
     if !event.zone.is_empty() {
@@ -1104,18 +1371,84 @@ fn header_block() -> Block<'static> {
         .border_style(Style::default().fg(Color::DarkGray))
 }
 
+fn move_graph_focus(app: &mut App, delta: isize) {
+    if app.visible_events.is_empty() {
+        app.graph_focus = 0;
+        return;
+    }
+    let len = app.visible_events.len() as isize;
+    app.graph_focus = (app.graph_focus as isize + delta).rem_euclid(len) as usize;
+    app.selected = app.graph_focus;
+    if let Some(event) = app.visible_events.get(app.graph_focus) {
+        app.status = format!("Focused node: {} ({})", event.name, event.type_name);
+    }
+}
+
+fn handle_mouse(app: &mut App, mouse: MouseEvent, area: ratatui::layout::Rect) {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let x = mouse.column;
+            let y = mouse.row;
+            if y < 3 {
+                let tab_start = area.width.saturating_sub(48);
+                if x >= tab_start {
+                    app.active_tab = ((x - tab_start) / 12).min(3) as usize;
+                }
+            } else if app.active_tab == 0 && y >= area.height.saturating_sub(7) {
+                app.toggle_play();
+            }
+        }
+        MouseEventKind::ScrollUp => move_graph_focus(app, -1),
+        MouseEventKind::ScrollDown => move_graph_focus(app, 1),
+        _ => {}
+    }
+}
+
 fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     if key.kind != KeyEventKind::Press {
         return false;
     }
+    if app.filter_active {
+        match key.code {
+            KeyCode::Esc => {
+                app.clear_filter();
+                return false;
+            }
+            KeyCode::Enter => {
+                app.filter_active = false;
+                app.rebuild_visible();
+                app.status = format!("Filter applied: {}", app.filter);
+                return false;
+            }
+            KeyCode::Backspace => {
+                app.filter.pop();
+                app.rebuild_visible();
+                return false;
+            }
+            KeyCode::Char(ch) => {
+                app.filter.push(ch);
+                app.rebuild_visible();
+                return false;
+            }
+            _ => return false,
+        }
+    }
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => true,
         KeyCode::Down | KeyCode::Char('j') => {
-            app.selected = (app.selected + 1).min(app.visible_events.len().saturating_sub(1));
+            move_graph_focus(app, 1);
             false
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            app.selected = app.selected.saturating_sub(1);
+            move_graph_focus(app, -1);
+            false
+        }
+        KeyCode::Char('h') => {
+            move_graph_focus(app, -1);
+            false
+        }
+        KeyCode::Char('l') => {
+            move_graph_focus(app, 1);
             false
         }
         KeyCode::Char(' ') => {
@@ -1130,22 +1463,36 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             app.export_record();
             false
         }
+        KeyCode::Char('/') => {
+            app.toggle_filter();
+            false
+        }
+        KeyCode::Char('c') => {
+            app.clear_filter();
+            false
+        }
         KeyCode::Tab => {
             app.active_tab = (app.active_tab + 1) % 4;
             false
         }
+        KeyCode::Char('[') => {
+            app.step_to_previous_event();
+            false
+        }
+        KeyCode::Char(']') => {
+            app.step_to_next_event();
+            false
+        }
+        KeyCode::Enter => {
+            app.selected = app.graph_focus.min(app.visible_events.len().saturating_sub(1));
+            false
+        }
         KeyCode::Left => {
-            app.follow_live = false;
-            app.playing = false;
-            app.cursor_ms = app.cursor_ms.saturating_sub(200);
-            app.rebuild();
+            app.step_to_previous_event();
             false
         }
         KeyCode::Right => {
-            app.follow_live = false;
-            app.playing = false;
-            app.cursor_ms = (app.cursor_ms + 200).min(app.max_ms);
-            app.rebuild();
+            app.step_to_next_event();
             false
         }
         _ => false,
@@ -1156,11 +1503,12 @@ fn run(mut terminal: DefaultTerminal, mut app: App) -> io::Result<()> {
     loop {
         app.tick();
         terminal.draw(|frame| ui(frame, &app))?;
-        if event::poll(Duration::from_millis(80))?
-            && let Event::Key(key) = event::read()?
-            && handle_key(&mut app, key)
-        {
-            return Ok(());
+        if event::poll(Duration::from_millis(80))? {
+            match event::read()? {
+                Event::Key(key) if handle_key(&mut app, key) => return Ok(()),
+                Event::Mouse(mouse) => handle_mouse(&mut app, mouse, terminal.get_frame().area()),
+                _ => {}
+            }
         }
     }
 }
@@ -1171,6 +1519,70 @@ fn load_events(path: &Path) -> Vec<VariableEvent> {
         .lines()
         .filter_map(|line| serde_json::from_str(line.trim()).ok())
         .collect()
+}
+
+#[derive(Serialize)]
+struct ExportReport {
+    event_count: usize,
+    node_count: usize,
+    cursor_ms: u64,
+    max_ms: u64,
+    nodes: Vec<VariableEvent>,
+}
+
+fn export_report(events: Vec<VariableEvent>, output: &Path, format: &str) -> io::Result<()> {
+    let mut states = HashMap::new();
+    for event in &events {
+        match event.kind {
+            EventKind::Declare => {
+                states.insert(event.id.clone(), event.clone());
+            }
+            EventKind::Update => {
+                if states.contains_key(&event.id) {
+                    states.insert(event.id.clone(), event.clone());
+                }
+            }
+            EventKind::Drop => {
+                if let Some(current) = states.get_mut(&event.id) {
+                    current.value = "<dropped>".into();
+                }
+            }
+        }
+    }
+    let max_ms = events.iter().map(|event| event.time_ms).max().unwrap_or(0);
+    let nodes = states.into_values().collect::<Vec<_>>();
+    let report = ExportReport {
+        event_count: events.len(),
+        node_count: nodes.len(),
+        cursor_ms: max_ms,
+        max_ms,
+        nodes: nodes.clone(),
+    };
+    let content = if format.eq_ignore_ascii_case("text") {
+        let mut text = format!(
+            "Baxan report\\nEvents: {}\\nNodes: {}\\nTimeline: {}ms\\n\\n",
+            report.event_count, report.node_count, report.max_ms
+        );
+        for node in nodes {
+            text.push_str(&format!(
+                "{}: {} = {} ({} bytes, {})\\n",
+                node.name,
+                node.type_name,
+                node.value,
+                node.bytes,
+                event_zone(&node)
+            ));
+        }
+        text
+    } else if format.eq_ignore_ascii_case("json") {
+        serde_json::to_string_pretty(&report).map_err(io::Error::other)?
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "export format must be 'json' or 'text'",
+        ));
+    };
+    fs::write(output, content)
 }
 
 // ------------------------------------------------------------------
@@ -1338,11 +1750,21 @@ fn main() -> io::Result<()> {
         return run_project(&args.project, &args.args);
     }
 
+    let events = if args.demo {
+        demo_events()
+    } else if let Some(path) = args.events.as_deref() {
+        load_events(path)
+    } else {
+        demo_events()
+    };
+    if let Some(output) = args.export.as_deref() {
+        return export_report(events, output, &args.export_format);
+    }
+
     let project = fs::canonicalize(&args.project).unwrap_or(args.project);
     enable_raw_mode().ok();
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).ok();
-    let terminal = ratatui::init();
+    execute!(stdout, EnterAlternateScreen).ok();        let terminal = ratatui::init();
     let result = run(terminal, App::new(project, args.events, args.demo));
     ratatui::restore();
     disable_raw_mode().ok();

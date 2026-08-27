@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <time.h>
+#include <pthread.h>
 
 /* ------------------------------------------------------------------ */
 /* Shared state                                                        */
@@ -29,6 +30,7 @@ static int          tracker_fd = -1;
 static int          file_init  = 0;
 static size_t       seq        = 0;
 static volatile int emit_lock  = 0;
+static uint64_t start_ms = 0;
 
 static void lock_emit(void) {
     while (__sync_lock_test_and_set(&emit_lock, 1)) {
@@ -41,7 +43,17 @@ static void unlock_emit(void) {
 static uint64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    uint64_t current = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    return start_ms == 0 ? 0 : current - start_ms;
+}
+
+static unsigned long thread_id(void) {
+    return (unsigned long)(uintptr_t)pthread_self();
+}
+
+static void thread_name(char *out, size_t cap) {
+    int n = snprintf(out, cap, "thread-%lu", thread_id());
+    if (n < 0 && cap > 0) out[0] = '\0';
 }
 
 static void ensure_file(void) {
@@ -53,16 +65,18 @@ static void ensure_file(void) {
 }
 
 static void emit_declare(const char *id, const char *val,
-                          size_t bytes, const char *addr) {
+                          size_t bytes, const char *addr, const char *points_to) {
     ensure_file();
     if (tracker_fd < 0) return;
-    char buf[256];
+    char buf[512];
+    char thread[64];
+    thread_name(thread, sizeof(thread));
     int n = snprintf(buf, sizeof(buf),
         "{\"seq\":%zu,\"time_ms\":%lu,\"kind\":\"declare\","
         "\"id\":\"%s\",\"name\":\"%s\",\"type_name\":\"heap\","
         "\"value\":\"%s\",\"storage\":\"heap\",\"zone\":\"heap\","
-        "\"address\":\"%s\",\"bytes\":%zu,\"thread\":\"main\"}\n",
-        ++seq, (unsigned long)now_ms(), id, id, val, addr, bytes);
+        "\"address\":\"%s\",\"points_to\":[\"%s\"],\"bytes\":%zu,\"thread\":\"%s\"}\n",
+        ++seq, (unsigned long)now_ms(), id, id, val, addr, points_to, bytes, thread);
     if (n > 0) {
         lock_emit();
         write(tracker_fd, buf, (size_t)n);
@@ -73,13 +87,15 @@ static void emit_declare(const char *id, const char *val,
 static void emit_drop(const char *id, const char *addr) {
     ensure_file();
     if (tracker_fd < 0) return;
-    char buf[256];
+    char buf[512];
+    char thread[64];
+    thread_name(thread, sizeof(thread));
     int n = snprintf(buf, sizeof(buf),
         "{\"seq\":%zu,\"time_ms\":%lu,\"kind\":\"drop\","
         "\"id\":\"%s\",\"name\":\"%s\",\"type_name\":\"heap\","
         "\"value\":\"<dropped>\",\"storage\":\"heap\",\"zone\":\"heap\","
-        "\"address\":\"%s\",\"bytes\":0,\"thread\":\"main\"}\n",
-        ++seq, (unsigned long)now_ms(), id, id, addr);
+        "\"address\":\"%s\",\"points_to\":[],\"bytes\":0,\"thread\":\"%s\"}\n",
+        ++seq, (unsigned long)now_ms(), id, id, addr, thread);
     if (n > 0) {
         lock_emit();
         write(tracker_fd, buf, (size_t)n);
@@ -118,7 +134,7 @@ static void *track_malloc(size_t sz) {
         snprintf(id,   sizeof(id),   "h_%p", p);
         snprintf(addr, sizeof(addr), "%p",   p);
         snprintf(val,  sizeof(val),  "%zuB", sz);
-        emit_declare(id, val, sz, addr);
+        emit_declare(id, val, sz, addr, "");
     }
     return p;
 }
@@ -144,7 +160,7 @@ static void *track_calloc(size_t n, size_t s) {
         snprintf(id,   sizeof(id),   "h_%p", p);
         snprintf(addr, sizeof(addr), "%p",   p);
         snprintf(val,  sizeof(val),  "%zuB", total);
-        emit_declare(id, val, total, addr);
+        emit_declare(id, val, total, addr, "");
     }
     return p;
 }
@@ -158,11 +174,12 @@ static void *track_realloc(void *p, size_t sz) {
     }
     void *np = real_realloc(p, sz);
     if (np) {
-        char id[24], addr[24], val[24];
+        char id[24], addr[24], val[24], old_id[24];
         snprintf(id,   sizeof(id),   "h_%p", np);
+        snprintf(old_id, sizeof(old_id), "h_%p", p);
         snprintf(addr, sizeof(addr), "%p",   np);
         snprintf(val,  sizeof(val),  "%zuB", sz);
-        emit_declare(id, val, sz, addr);
+        emit_declare(id, val, sz, addr, old_id);
     }
     return np;
 }
@@ -280,6 +297,9 @@ static void tracker_init(void) {
     if (path && path[0])
         tracker_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     file_init = 1;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    start_ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 
     /* Patch malloc/free/calloc/realloc pointers in every loaded image. */
     uint32_t c = _dyld_image_count();
@@ -302,7 +322,7 @@ void *malloc(size_t sz) {
         snprintf(id,   sizeof(id),   "h_%p", p);
         snprintf(addr, sizeof(addr), "%p",   p);
         snprintf(val,  sizeof(val),  "%zuB", sz);
-        emit_declare(id, val, sz, addr);
+        emit_declare(id, val, sz, addr, "");
     }
     return p;
 }
@@ -330,7 +350,7 @@ void *calloc(size_t n, size_t s) {
         snprintf(id,   sizeof(id),   "h_%p", p);
         snprintf(addr, sizeof(addr), "%p",   p);
         snprintf(val,  sizeof(val),  "%zuB", total);
-        emit_declare(id, val, total, addr);
+        emit_declare(id, val, total, addr, "");
     }
     return p;
 }
@@ -346,11 +366,12 @@ void *realloc(void *p, size_t sz) {
     }
     void *np = rr(p, sz);
     if (np) {
-        char id[24], addr[24], val[24];
+        char id[24], addr[24], val[24], old_id[24];
         snprintf(id,   sizeof(id),   "h_%p", np);
+        snprintf(old_id, sizeof(old_id), "h_%p", p);
         snprintf(addr, sizeof(addr), "%p",   np);
         snprintf(val,  sizeof(val),  "%zuB", sz);
-        emit_declare(id, val, sz, addr);
+        emit_declare(id, val, sz, addr, old_id);
     }
     return np;
 }
