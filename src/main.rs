@@ -156,6 +156,31 @@ struct App {
 }
 
 impl App {
+    fn with_events(project: PathBuf, source_events: Vec<VariableEvent>, events_path: Option<PathBuf>) -> Self {
+        let mut app = Self {
+            project,
+            events_path,
+            source_events,
+            visible_events: Vec::new(),
+            states: HashMap::new(),
+            selected: 0,
+            active_tab: 0,
+            playing: false,
+            follow_live: true,
+            cursor_ms: 0,
+            max_ms: 1,
+            last_tick: Instant::now(),
+            animation_frame: 0,
+            file_offset: 0,
+            status: "Ready · memory map follows runtime events".into(),
+            graph_focus: 0,
+            filter: String::new(),
+            filter_active: false,
+        };
+        app.rebuild();
+        app
+    }
+
     fn new(project: PathBuf, events_path: Option<PathBuf>, demo: bool) -> Self {
         let source_events = if demo || events_path.is_none() {
             demo_events()
@@ -1721,9 +1746,10 @@ fn run_project(project: &PathBuf, extra_args: &[String]) -> io::Result<()> {
     let events = load_events(&events_path);
     eprintln!("\u{1f4ca} Captured {} heap allocation events", events.len());
 
-    // 7. Clean up temp files
+    // The captured events are passed directly into the TUI below. Remove only
+    // the temporary tracker library; the event file is no longer needed after
+    // loading it into memory.
     let _ = std::fs::remove_file(&tracker_path);
-    let _ = std::fs::remove_file(&events_path);
 
     if events.is_empty() {
         eprintln!("\u{26a0}\u{fe0f}  No heap allocations captured. The program may use a custom allocator.");
@@ -1736,7 +1762,8 @@ fn run_project(project: &PathBuf, extra_args: &[String]) -> io::Result<()> {
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).ok();
     let terminal = ratatui::init();
-    let result = run(terminal, App::new(project, None, false));
+    let result = run(terminal, App::with_events(project, events, None));
+    let _ = std::fs::remove_file(&events_path);
     ratatui::restore();
     disable_raw_mode().ok();
     execute!(io::stdout(), LeaveAlternateScreen).ok();
